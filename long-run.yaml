@@ -1,0 +1,87 @@
+main:
+  params: [args]
+  steps:
+    - init:
+        assign:
+          - projectId: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+          - serviceAccountEmail: ${sys.get_env("GOOGLE_CLOUD_PROJECT_NUMBER") + "-compute@developer.gserviceaccount.com"}
+          - region: "us-central1"
+          - zone: ${ region + "-a"}
+          - machineType: "c2-standard-4"
+          - instanceName: ${args.instanceName}
+    - scriptCreation:
+        assign:
+          - scriptLine000: '#! /bin/bash'
+          - scriptLine001: '$(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/attributes/docker-command)'
+          - scriptLine002: 'toolbox apt-get install -y jq'
+          - scriptLine003: 'TOKEN=$(toolbox bash -c "curl -s -H \"Metadata-Flavor: Google\" http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token | jq -r .access_token")'
+          - scriptLine004: 'curl -H "Authorization: Bearer $TOKEN" $(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/attributes/callback-url)'
+    - create_callback:
+        call: events.create_callback_endpoint
+        args:
+          http_callback_method: "GET"
+        result: callback_details
+    - get_latest_image:
+        call: googleapis.compute.v1.images.getFromFamily
+        args:
+          family: "cos-stable"
+          project: "cos-cloud"
+        result: getFromFamilyResult
+    - create_and_start_vm:
+        call: googleapis.compute.v1.instances.insert
+        args:
+          project: ${projectId}
+          zone: ${zone}
+          body:
+            tags:
+              items:
+                - workflow-long-job
+            name: ${instanceName}
+            machineType: ${"zones/" + zone + "/machineTypes/" + machineType}
+            disks:
+              - initializeParams:
+                  sourceImage: ${"projects/cos-cloud/global/images/" + getFromFamilyResult.name}
+                boot: true
+                autoDelete: true
+            networkInterfaces:
+              - accessConfigs:
+                - name: "External NAT"
+                  networkTier: "PREMIUM"
+                subnetwork: ${"projects/" + projectId + "/regions/" + region +"/subnetworks/default"}
+            metadata:
+              items:
+                - key: "docker-command"
+                  value: ${"docker run --entrypoint echo debian hello " + instanceName }
+                - key: "callback-url"
+                  value: ${callback_details.url}
+                - key: "startup-script"
+                  value: ${scriptLine000 + "\n" +
+                    scriptLine001 + "\n" +
+                    scriptLine002 + "\n" +
+                    scriptLine003 + "\n" +
+                    scriptLine004
+                          }
+            # Needed to be able to pull down and run the container. Need to be able to invoke Cloud Workflow callback
+            serviceAccounts:
+              - email: ${serviceAccountEmail}
+                scopes:
+                  - https://www.googleapis.com/auth/cloud-platform
+    - await_callback:
+        call: events.await_callback
+        args:
+          callback: ${callback_details}
+          timeout: 25920000 #300 days. Max 365
+        result: callback_request
+    - print_callback_details:
+        call: sys.log
+        args:
+          severity: "INFO"
+          text: ${callback_request}
+    - delete_vm:
+        call: googleapis.compute.v1.instances.delete
+        args:
+          instance: ${instanceName}
+          project: ${projectId}
+          zone: ${zone}
+    - return_result:
+        return: "Job Done"
